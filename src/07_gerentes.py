@@ -1,6 +1,7 @@
 """Paso 7. Hojas de gerentes: cantidad y precio 2027 prellenados por cliente y descripción.
 
-Entrada : consulta/cache/ventas.parquet, proyeccion_base.parquet y consulta/catalogo.xlsx
+Entrada : consulta/cache/ventas.parquet, proyeccion_base.parquet, consulta/catalogo.xlsx
+          consulta/licitaciones.xlsx                       (opcional: ventas fijas por licitación)
 Salida  : output/revision_gerentes/Revision_<LINEA>.xlsx   (una por línea; se respeta lo que escriban)
           consulta/cache/filas_gerentes.parquet            (lo revisado, para los pasos siguientes)
 Correr  : py src/07_gerentes.py   (una vez para generar las hojas y otra vez cuando regresen llenas)
@@ -13,13 +14,17 @@ from openpyxl.utils import get_column_letter
 
 import comun as c
 
-PARTE_A = 0.80              # las filas que acumulan este % de la venta de la línea son prioridad A
+# Prioridad de cada fila según su venta sugerida 2027 en USD. Lo que queda debajo de C es D.
+UMBRALES = {"A": 100_000, "B": 50_000, "C": 25_000}
+ORDEN_PRIORIDAD = {"LICITACION": 0, "RESERVA": 1, "A": 2, "B": 3, "C": 4, "D": 5}
 CAMBIO_FUERTE = 30          # % de cambio en cantidad o precio que se lista para confirmar
 FILAS_EN_BLANCO = 40        # renglones vacíos al final de cada hoja para dar de alta clientes o productos
 
 cfg = c.cargar_config()
 CARPETA = cfg["carpeta_output"] / "revision_gerentes"
 CARPETA.mkdir(exist_ok=True)
+RUTA_LIC = cfg["carpeta_consulta"] / "licitaciones.xlsx"
+COLS_LIC = ["linea", "cliente", "rfc", "clase_et", "producto", "unidad", "cantidad_2027", "precio_2027", "comentario"]
 c.titulo("PASO 7. HOJAS DE GERENTES: cantidad y precio 2027 por cliente y descripción")
 ventas = c.leer_cache(cfg, "ventas", "01_ventas.py")
 p = c.leer_cache(cfg, "proyeccion_base", "06_proyeccion_2027.py")
@@ -74,11 +79,99 @@ sin_precio = d["precio_sugerido"].isna()
 d.loc[sin_precio, ["cantidad_sugerida", "precio_sugerido", "unidad"]] = [np.nan, 1.0, "USD"]
 d.loc[sin_precio, "cantidad_sugerida"] = d.loc[sin_precio, "venta_sugerida"]
 d = d[d["venta_sugerida"] > 0.5].copy()
-orden = d.sort_values("venta_sugerida", ascending=False)
-antes = orden.groupby("linea")["venta_sugerida"].cumsum() - orden["venta_sugerida"]
-d["prioridad"] = (antes < PARTE_A * orden.groupby("linea")["venta_sugerida"].transform("sum")).map({True: "A", False: "B"})
+
+
+def prioridad(venta):
+    for nivel, minimo in UMBRALES.items():
+        if venta >= minimo:
+            return nivel
+    return "D"
+
+
+d["prioridad"] = d["venta_sugerida"].map(prioridad)
+d.loc[d["confianza"] == "RESERVA", "prioridad"] = "RESERVA"
 d["id_fila"] = d["linea"] + "|" + d["cliente_id"] + "|" + d["clase_et"] + "|" + d["producto"]
 d["cantidad_2027"], d["precio_2027"], d["motivo"], d["alta"] = d["cantidad_sugerida"], d["precio_sugerido"], "", False
+d["licitacion"] = False
+
+# ------------------------------------------------------------------ 1b. Licitaciones (ventas fijas)
+# Cada renglón de licitaciones.xlsx entra con su cantidad y precio fijos. Sustituye la sugerencia del
+# modelo para ese mismo cliente y clase; el resto de la clase (otros clientes) no cambia.
+c.subtitulo("Licitaciones")
+if not RUTA_LIC.exists():
+    instrucciones = pd.DataFrame({"instrucciones": [
+        "Un renglón por cliente y producto con licitación para 2027.",
+        "linea: tal cual, por ejemplo BU-PHARMA.",
+        "cliente: el nombre del cliente. rfc: opcional, pero ayuda a encontrarlo.",
+        "clase_et: la clase del catálogo. La licitación sustituye la sugerencia de ese cliente en esa clase.",
+        "producto: la descripción del producto.",
+        "cantidad_2027 y precio_2027: los de la licitación, en USD por unidad.",
+        "Después corre el paso 7 otra vez."]})
+    c.escribir_excel({"licitaciones": pd.DataFrame(columns=COLS_LIC), "instrucciones": instrucciones}, RUTA_LIC,
+                     anchos={"cliente": 36, "producto": 50, "clase_et": 30, "instrucciones": 100})
+    print(f"Se creó {RUTA_LIC.name} vacío. Llénalo cuando tengas la lista de licitaciones.")
+lic = pd.read_excel(RUTA_LIC, sheet_name="licitaciones", dtype=object).reindex(columns=COLS_LIC)
+lic = lic[lic["cliente"].notna() | lic["producto"].notna()].copy()
+reemplazadas = pd.DataFrame()
+if len(lic):
+    for col in ("cantidad_2027", "precio_2027"):
+        lic[col] = pd.to_numeric(lic[col], errors="coerce")
+    for col in ("linea", "cliente", "rfc", "clase_et", "producto", "unidad", "comentario"):
+        lic[col] = lic[col].fillna("").astype(str).str.strip()
+    lic["linea"] = lic["linea"].str.upper()
+    incompletas = lic[~lic["linea"].isin(c.LINEAS) | (lic["cliente"] == "") | (lic["clase_et"] == "")
+                      | lic["cantidad_2027"].isna() | lic["precio_2027"].isna()]
+    if len(incompletas):
+        c.aviso(f"{len(incompletas)} licitaciones incompletas (no entran). Necesitan linea válida, cliente, clase_et, "
+                "cantidad_2027 y precio_2027:")
+        c.mostrar(incompletas[COLS_LIC])
+    lic = lic.drop(incompletas.index)
+    # Encontrar al cliente: primero por RFC, luego por nombre
+    nombres = v.groupby(["linea", "cliente_id"])["venta"].sum().reset_index().merge(
+        v.groupby("cliente_id")["cliente"].last().reset_index(), on="cliente_id")
+    nombres["n"] = nombres["cliente"].map(c.norm)
+    por_nombre = nombres.sort_values("venta").drop_duplicates(["linea", "n"], keep="last").set_index(["linea", "n"])["cliente_id"]
+    rfcs = set(v["cliente_id"])
+    ids, como = [], []
+    for linea, cliente, rfc in zip(lic["linea"], lic["cliente"], lic["rfc"].str.upper()):
+        if rfc and rfc in rfcs:
+            ids.append(rfc); como.append("RFC")
+        elif (linea, c.norm(cliente)) in por_nombre.index:
+            ids.append(por_nombre[(linea, c.norm(cliente))]); como.append("nombre")
+        else:
+            ids.append("LICIT-" + c.norm(cliente)); como.append("NO ENCONTRADO: cliente nuevo")
+    lic["cliente_id"], lic["encontrado_por"] = ids, como
+    nombre_real = v.groupby("cliente_id")["cliente"].last()
+    lic["cliente"] = lic["cliente_id"].map(nombre_real).fillna(lic["cliente"])
+    lic["clase_n"] = lic["clase_et"].map(c.norm)
+    clases_linea = set(zip(p["linea"], p["clase_et"]))
+    lic["clase_existe"] = [(l, k) in clases_linea for l, k in zip(lic["linea"], lic["clase_n"])]
+    filas_lic = pd.DataFrame({
+        "linea": lic["linea"], "clase_et": lic["clase_n"], "grupo": "LICITACION", "cliente_id": lic["cliente_id"],
+        "cliente": lic["cliente"], "producto": lic["producto"].map(c.norm), "unidad": lic["unidad"], "key_ref": "",
+        "venta_sugerida": 0.0, "cantidad_sugerida": lic["cantidad_2027"], "precio_sugerido": lic["precio_2027"],
+        "confianza": "FIJA", "meses_con_compra": 0, "prioridad": "LICITACION",
+        "cantidad_2027": lic["cantidad_2027"], "precio_2027": lic["precio_2027"],
+        "motivo": ("LICITACIÓN " + lic["comentario"]).str.strip(), "alta": False, "licitacion": True})
+    filas_lic["id_fila"] = "LICIT|" + filas_lic["linea"] + "|" + filas_lic["cliente_id"] + "|" + filas_lic["clase_et"] + "|" + filas_lic["producto"]
+    # Las sugerencias del modelo que sustituye
+    llave_lic = set(zip(filas_lic["linea"], filas_lic["cliente_id"], filas_lic["clase_et"]))
+    sustituida = pd.Series([k in llave_lic for k in zip(d["linea"], d["cliente_id"], d["clase_et"])], index=d.index)
+    reemplazadas = d[sustituida]
+    d = pd.concat([d[~sustituida], filas_lic], ignore_index=True)
+    lic["venta_2027"] = lic["cantidad_2027"] * lic["precio_2027"]
+    c.mostrar(lic[["linea", "cliente", "encontrado_por", "clase_n", "clase_existe", "cantidad_2027", "precio_2027", "venta_2027"]]
+              .rename(columns={"clase_n": "clase_et"}))
+    print(f"Licitaciones: {len(lic)} renglones, {lic['venta_2027'].sum():,.0f} USD. Sustituyen {len(reemplazadas)} filas del modelo "
+          f"({reemplazadas['venta_sugerida'].sum():,.0f} USD sugeridos).")
+    nuevos = lic[lic["encontrado_por"].str.startswith("NO")]
+    if len(nuevos):
+        c.aviso(f"{len(nuevos)} licitaciones con cliente no encontrado en las ventas. Entran como cliente nuevo; si sí existe, "
+                "corrige el nombre o agrega el RFC en licitaciones.xlsx.")
+    if (~lic["clase_existe"]).any():
+        c.aviso(f"{int((~lic['clase_existe']).sum())} licitaciones con una clase que no existe en esa línea. Revisa clase_et.")
+else:
+    print("Sin licitaciones capturadas (licitaciones.xlsx vacío).")
 
 COLS = ["prioridad", "confianza", "cliente", "clase_et", "producto", "unidad", "cantidad_2024", "venta_2024",
         "cantidad_2025", "venta_2025", "cantidad_12m", "venta_12m", "precio_12m", "cantidad_sugerida",
@@ -98,7 +191,8 @@ altas_malas = []
 for linea in c.LINEAS:
     corto = linea.replace("BU-", "").replace(" ", "_")
     ruta = CARPETA / f"Revision_{corto}.xlsx"
-    g = d[d["linea"] == linea].copy()
+    g = d[(d["linea"] == linea) & ~d["licitacion"]].copy()
+    fijas = d[(d["linea"] == linea) & d["licitacion"]].copy()
     nuevas = pd.DataFrame()
     if ruta.exists():
         prev = pd.read_excel(ruta, sheet_name="filas")
@@ -121,10 +215,12 @@ for linea in c.LINEAS:
                 "linea": linea, "clase_et": al["clase_et"].map(c.norm), "grupo": "ALTA", "cliente_id": "ALTA-" + al["cliente"].map(c.norm),
                 "cliente": al["cliente"].astype(str), "producto": al["producto"].map(c.norm), "unidad": al["unidad"].fillna("").astype(str),
                 "key_ref": "", "venta_sugerida": 0.0, "cantidad_sugerida": 0.0, "precio_sugerido": al["precio_2027"],
-                "confianza": "ALTA DEL GERENTE", "meses_con_compra": 0, "prioridad": "A", "id_fila": np.nan,
+                "confianza": "ALTA DEL GERENTE", "meses_con_compra": 0, "id_fila": np.nan,
                 "cantidad_2027": al["cantidad_2027"], "precio_2027": al["precio_2027"],
-                "motivo": al["motivo"].fillna("").astype(str), "alta": True})
-    g = g.sort_values(["prioridad", "venta_sugerida"], ascending=[True, False])
+                "motivo": al["motivo"].fillna("").astype(str), "alta": True, "licitacion": False})
+            nuevas["prioridad"] = (nuevas["cantidad_2027"] * nuevas["precio_2027"]).map(prioridad)
+    g = pd.concat([fijas, g], ignore_index=True)
+    g = g.assign(o=g["prioridad"].map(ORDEN_PRIORIDAD)).sort_values(["o", "venta_sugerida"], ascending=[True, False]).drop(columns="o")
     hoja = pd.concat([g, nuevas], ignore_index=True) if len(nuevas) else g
     hoja = hoja.assign(venta_2027=np.nan)[COLS]
     pend = altas_malas[-1].reindex(columns=COLS) if altas_malas and len(altas_malas[-1]) else None
@@ -140,12 +236,19 @@ for linea in c.LINEAS:
     for r in range(2, len(hoja) + 2 + FILAS_EN_BLANCO):
         ws[f"{vt}{r}"] = f'=IF(OR({q}{r}="",{pr}{r}=""),"",{q}{r}*{pr}{r})'
     amarillo = PatternFill("solid", fgColor="FFF2CC")
+    gris = PatternFill("solid", fgColor="D9D9D9")
     for col in EDITABLES:
         for r in range(1, len(hoja) + 2 + FILAS_EN_BLANCO):
             ws[f"{letra[col]}{r}"].fill = amarillo
+    for r, pri in enumerate(hoja["prioridad"], start=2):         # las licitaciones no se editan aquí
+        if pri == "LICITACION":
+            for col in EDITABLES:
+                ws[f"{letra[col]}{r}"].fill = gris
     wb.save(ruta)
     d = pd.concat([d[d["linea"] != linea], g, nuevas], ignore_index=True)
-    print(f"{ruta.name}: {len(g):,} filas ({int((g['prioridad'] == 'A').sum())} de prioridad A), {len(nuevas)} altas")
+    cuenta = g["prioridad"].value_counts()
+    print(f"{ruta.name}: {len(g):,} filas | " + " | ".join(f"{k}: {int(cuenta.get(k, 0))}" for k in ORDEN_PRIORIDAD if cuenta.get(k, 0))
+          + f" | altas: {len(nuevas)}")
 
 malas = pd.concat(altas_malas, ignore_index=True) if altas_malas else pd.DataFrame()
 if len(malas):
@@ -156,17 +259,24 @@ if len(malas):
 d["venta_final"] = d["cantidad_2027"] * d["precio_2027"]
 d["cambio_cantidad_%"] = (100 * (d["cantidad_2027"] / d["cantidad_sugerida"].replace(0, np.nan) - 1)).round(1)
 d["cambio_precio_%"] = (100 * (d["precio_2027"] / d["precio_sugerido"].replace(0, np.nan) - 1)).round(1)
-d["ajustada"] = d["alta"] | (d["cambio_cantidad_%"].abs() > 0.5) | (d["cambio_precio_%"].abs() > 0.5)
+d["ajustada"] = d["alta"] | (~d["licitacion"] & ((d["cambio_cantidad_%"].abs() > 0.5) | (d["cambio_precio_%"].abs() > 0.5)))
 c.guardar_cache(cfg, "filas_gerentes", d[["linea", "clase_et", "grupo", "cliente_id", "cliente", "producto", "unidad", "key_ref",
                                            "prioridad", "confianza", "cantidad_sugerida", "precio_sugerido", "venta_sugerida",
-                                           "cantidad_2027", "precio_2027", "venta_final", "ajustada", "alta", "motivo"]])
+                                           "cantidad_2027", "precio_2027", "venta_final", "ajustada", "alta", "licitacion", "motivo"]])
 
 c.subtitulo("Cuántas filas y de qué tipo")
-t = d[~d["alta"]].groupby(["prioridad", "confianza"]).agg(filas=("venta_sugerida", "size"), venta_sugerida=("venta_sugerida", "sum")).reset_index()
-t["% de la venta"] = (100 * t["venta_sugerida"] / t["venta_sugerida"].sum()).round(1)
-c.mostrar(t)
-print("Prioridad A = las filas que hacen el 80% de la venta de su línea. Confianza = qué tan seguido compra el cliente")
-print("(ALTA: 6 o más meses del último año; MEDIA: 3 a 5; BAJA: 1 o 2).")
+vista_p = d[~d["alta"]].assign(venta=lambda x: x["cantidad_2027"] * x["precio_2027"])
+t = vista_p.pivot_table(index="linea", columns="prioridad", values="venta", aggfunc="size").reindex(
+    index=c.LINEAS, columns=[k for k in ORDEN_PRIORIDAD if k in set(vista_p["prioridad"])]).fillna(0).astype(int)
+print("Número de filas por prioridad:")
+print(t.to_string())
+pv = vista_p.pivot_table(index="linea", columns="prioridad", values="venta", aggfunc="sum").reindex(
+    index=c.LINEAS, columns=t.columns).fillna(0)
+print("\n% de la venta 2027 de la línea:")
+print((100 * pv.div(pv.sum(axis=1), axis=0)).round(1).to_string())
+print(f"\nPrioridad por venta sugerida 2027: A {UMBRALES['A']:,} o más | B {UMBRALES['B']:,} o más | C {UMBRALES['C']:,} o más | D menos.")
+print("Confianza = qué tan seguido compra el cliente (ALTA: 6 o más meses del último año; MEDIA: 3 a 5; BAJA: 1 o 2).")
+c.mostrar(vista_p.groupby("confianza").agg(filas=("venta", "size"), venta=("venta", "sum")).reset_index())
 
 c.subtitulo("Cambios de los gerentes")
 aj = d[d["ajustada"]]
@@ -183,17 +293,22 @@ else:
                                              "No es error, pero confirma que el motivo lo explique")
 
 c.subtitulo("Proyección 2027 por línea (millones USD)")
-res = d.groupby("linea").agg(base_2027=("venta_sugerida", "sum"), gerentes_2027=("venta_final", "sum"),
-                             filas_cambiadas=("ajustada", "sum")).reindex(c.LINEAS)
+d["venta_licitacion"] = d["venta_final"].where(d["licitacion"], 0.0)
+res = d.groupby("linea").agg(base_2027=("venta_sugerida", "sum"), licitaciones=("venta_licitacion", "sum"),
+                             gerentes_2027=("venta_final", "sum"), filas_cambiadas=("ajustada", "sum")).reindex(c.LINEAS).fillna(0)
 res.loc["TOTAL"] = res.sum()
-vista = (res[["base_2027", "gerentes_2027"]] / 1e6).round(2)
+print("base_2027 = lo que propone el modelo (sin las filas que sustituyen las licitaciones); gerentes_2027 ya incluye licitaciones.")
+vista = (res[["base_2027", "licitaciones", "gerentes_2027"]] / 1e6).round(2)
 vista["filas_cambiadas"] = res["filas_cambiadas"].astype(int)
 vista["gerentes vs base %"] = (100 * (res["gerentes_2027"] / res["base_2027"] - 1)).round(1)
 print(vista.to_string())
 
 c.subtitulo("Controles")
-esperado, obtenido = p["base_2027"].sum(), d.loc[~d["alta"], "venta_sugerida"].sum()
-(c.ok if abs(esperado - obtenido) < 100 else c.aviso)(f"Las filas suman la proyección base: {obtenido:,.0f} de {esperado:,.0f}")
+sustituido = reemplazadas["venta_sugerida"].sum() if len(reemplazadas) else 0.0
+esperado = p["base_2027"].sum() - sustituido
+obtenido = d.loc[~d["alta"] & ~d["licitacion"], "venta_sugerida"].sum()
+(c.ok if abs(esperado - obtenido) < 100 else c.aviso)(
+    f"Las filas del modelo suman la proyección base menos lo sustituido por licitaciones: {obtenido:,.0f} de {esperado:,.0f}")
 neg = int(((d["cantidad_2027"] < 0) | (d["precio_2027"] < 0)).sum())
 (c.ok if neg == 0 else c.aviso)(f"Filas con cantidad o precio negativo: {neg}")
 print(f"\nHojas en: {CARPETA}")

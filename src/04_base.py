@@ -13,6 +13,18 @@ import comun as c
 # Cifras de control del archivo 0__VIP_2027_V1_0.xlsx. Si cambias el Excel, cambian.
 ESPERADO = {"venta_real": 544977338.50, "usd_ordenes": 32757878.46, "usd_ppto": 123095049.13}
 
+# Nombre corto del fabricante: las primeras palabras de su nombre. Dos en Pharma y Animal Health
+# (para distinguir, por ejemplo, SHANDONG LUKANG de SHANDONG GUOBANG) y una en las demás líneas.
+PALABRAS_NOMBRE_CORTO = {"BU-PHARMA": 2, "BU-ANIMAL HEALTH": 2, "BU-DELIVERY SYSTEMS": 1,
+                         "BU-CARE CHEMICALS": 1, "BU-NUTRITION": 1}
+
+
+def nombre_corto(fabricante, linea):
+    palabras = [w.strip(",.;:") for w in str(fabricante).split()]
+    palabras = [w for w in palabras if w]
+    return " ".join(palabras[:PALABRAS_NOMBRE_CORTO.get(linea, 1)])
+
+
 cfg = c.cargar_config()
 RUTA_CAT = cfg["carpeta_consulta"] / "catalogo.xlsx"
 RUTA_EQ = cfg["carpeta_consulta"] / "equivalencias_ppto.xlsx"
@@ -144,10 +156,12 @@ c.mostrar(eq.loc[eq["estado"] != "ok", ["linea", "clase_ppto", "clase_catalogo",
 columnas = ["version", "anio", "mes", "linea", "cliente_id", "cliente", "agente", "key_id", "clase_et",
             "descripcion", "fabricante", "unidad", "cantidad", "venta", "utilidad"]
 base = pd.concat([real[columnas], ordenes[columnas], ppto[columnas]], ignore_index=True)
+base.insert(base.columns.get_loc("fabricante") + 1, "fabricante_corto",
+            [nombre_corto(f, l) for f, l in zip(base["fabricante"], base["linea"])])
 base["precio_usd"] = (base["venta"] / base["cantidad"]).where(base["cantidad"] != 0)
 c.guardar_cache(cfg, "base", base)
 print("\nEscribiendo el Excel entregable (tarda cerca de un minuto)...")
-c.escribir_excel(base, RUTA_OUT, hoja="bd_general", anchos={"cliente": 40, "descripcion": 55, "clase_et": 35})
+c.escribir_excel(base, RUTA_OUT, hoja="bd_general", anchos={"cliente": 40, "descripcion": 55, "clase_et": 35, "fabricante": 40})
 
 # ------------------------------------------------------------------ 5. Controles
 c.subtitulo("Controles")
@@ -171,5 +185,9 @@ print((base.pivot_table(index="linea", columns=["version", "anio"], values="vent
       .reindex(c.LINEAS).round(2).fillna(0).to_string())
 print(f"\nFilas: {len(base):,} | clases: {base['clase_et'].nunique():,} | clientes: {base['cliente_id'].nunique():,}")
 c.mostrar(base.groupby("version").agg(filas=("venta", "size"), venta=("venta", "sum")).reset_index())
+c.subtitulo("Nombre corto del fabricante (2 palabras en Pharma y Animal Health, 1 en las demás)")
+ej = base[base["fabricante"] != ""].drop_duplicates(["linea", "fabricante"]).groupby("linea").head(2)
+c.mostrar(ej[["linea", "fabricante", "fabricante_corto"]].sort_values("linea"))
+print(f"Filas sin fabricante (sin nombre corto): {int((base['fabricante_corto'] == '').sum()):,}")
 print(f"\nGuardado: {RUTA_OUT}\nGuardado: {RUTA_EQ}")
 c.cierre("PASO 4")

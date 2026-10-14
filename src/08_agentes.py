@@ -1,6 +1,14 @@
 """Paso 8. Dispersión por agente: reparte lo revisado por los gerentes y genera la hoja de cada agente.
 
-Entrada : consulta/cache/filas_gerentes.parquet, ventas.parquet y consulta/catalogo.xlsx
+Entrada : consulta/cache/filas_gerentes.parquet, ventas.parquet, ppto2026.parquet y consulta/catalogo.xlsx
+
+Regla del agente de cada fila (cliente + producto), en este orden:
+  1. El 'agente_vigente' escrito a mano en agentes_clientes.xlsx.
+  2. El agente del presupuesto 2026 para esa línea y cliente: la última fila que aparece en la pestaña
+     BD PPTO 2026, igual que la columna NUEVA ASIGNACIO AGENTES de la BD GENERAL original.
+  3. El agente que más le facturó esa fila (cliente + producto) en los últimos 12 meses; si la fila no
+     tiene facturas, el que más le facturó al cliente en esa línea.
+  4. Si no hay nada: POR DEFINIR.
 Salida  : consulta/agentes_nombres.xlsx                  (para unificar nombres de agentes; editable)
           consulta/agentes_clientes.xlsx                 (agente vigente de cada cliente; editable)
           output/precios_agentes/Precios_<AGENTE>.xlsx   (una por agente; se respeta el precio que verifiquen)
@@ -25,6 +33,7 @@ RUTA_NOM = cfg["carpeta_consulta"] / "agentes_nombres.xlsx"
 RUTA_CLI = cfg["carpeta_consulta"] / "agentes_clientes.xlsx"
 c.titulo("PASO 8. DISPERSIÓN POR AGENTE")
 ventas = c.leer_cache(cfg, "ventas", "01_ventas.py")
+ppto26 = c.leer_cache(cfg, "ppto2026", "00_preparar.py")
 filas = c.leer_cache(cfg, "filas_gerentes", "07_gerentes.py")
 base = c.leer_cache(cfg, "base", "04_base.py")
 patron = c.patron_mensual(base[base["version"] == "REAL"])
@@ -39,6 +48,8 @@ def limpio(s):
 # ------------------------------------------------------------------ 1. Nombres de agentes (para unir duplicados)
 ult = ult.assign(agente=ult["agente"].map(limpio))
 nom = ult.groupby("agente", as_index=False).agg(venta_12m=("venta", "sum"), clientes=("cliente_id", "nunique"))
+solo_ppto = sorted(set(ppto26["agente"].map(limpio)) - set(nom["agente"]) - {""})
+nom = pd.concat([nom, pd.DataFrame({"agente": solo_ppto, "venta_12m": 0.0, "clientes": 0})], ignore_index=True)
 nom = nom.rename(columns={"agente": "nombre_en_facturas"}).sort_values("venta_12m", ascending=False)
 nom["nombre_final"] = nom["nombre_en_facturas"]
 if RUTA_NOM.exists():
@@ -46,58 +57,91 @@ if RUTA_NOM.exists():
     anterior = nom["nombre_en_facturas"].map(prev["nombre_final"])
     nom["nombre_final"] = anterior.where(anterior.notna() & (anterior != ""), nom["nombre_final"]).map(limpio)
 c.escribir_excel(nom[["nombre_en_facturas", "nombre_final", "clientes", "venta_12m"]], RUTA_NOM, hoja="agentes")
-ult = ult.assign(agente=ult["agente"].map(nom.set_index("nombre_en_facturas")["nombre_final"]))
+nombre_final = nom.set_index("nombre_en_facturas")["nombre_final"]
+ult = ult.assign(agente=ult["agente"].map(nombre_final))
 c.subtitulo("Agentes en las facturas de los últimos 12 meses")
 c.mostrar(ult.groupby("agente").agg(clientes=("cliente_id", "nunique"), venta_12m=("venta", "sum")).reset_index()
           .sort_values("venta_12m", ascending=False))
 print("Si dos nombres son la misma persona, escribe el mismo 'nombre_final' en agentes_nombres.xlsx y vuelve a correr.")
 
 # ------------------------------------------------------------------ 2. Agente de cada cliente
+# a) Del presupuesto 2026: la última fila de cada línea + cliente (como el XLOOKUP de la BD GENERAL original)
+p26 = ppto26.copy()
+p26["agente"] = p26["agente"].map(limpio)
+p26["agente"] = p26["agente"].map(nombre_final).fillna(p26["agente"])
+generico = p26["rfc"].str.upper().str.startswith(("XAXX", "XEXX")) | p26["rfc"].isin(["", "0"])
+p26["cliente_id"] = p26["rfc"].str.upper()
+p26.loc[generico, "cliente_id"] = "SIN_RFC-" + p26.loc[generico, "cliente"].map(c.norm)
+p26 = p26[p26["agente"] != ""]
+agente_ppto = p26.groupby(["linea", "cliente_id"])["agente"].last().to_dict()
+agente_ppto_nombre = p26.assign(n=p26["cliente"].map(c.norm)).groupby(["linea", "n"])["agente"].last().to_dict()
+
+
+def del_ppto(linea, cliente_id, cliente):
+    if (linea, cliente_id) in agente_ppto:
+        return agente_ppto[(linea, cliente_id)]
+    return agente_ppto_nombre.get((linea, c.norm(cliente)), "")
+
+
+# b) De las facturas: quién más le facturó
 por_cli = ult.groupby(["linea", "cliente_id", "agente"], as_index=False)["venta"].sum()
 por_cli = por_cli[por_cli["venta"] > 0]
 por_cli["parte"] = por_cli["venta"] / por_cli.groupby(["linea", "cliente_id"])["venta"].transform("sum")
 texto = por_cli.sort_values("parte", ascending=False).groupby(["linea", "cliente_id"]).apply(
     lambda g: " | ".join(f"{a} {100 * q:.0f}%" for a, q in zip(g["agente"], g["parte"]))).rename("agentes_12m")
+mayor_cli = por_cli.sort_values("venta").groupby(["linea", "cliente_id"])["agente"].last().to_dict()
+por_fila = ult.groupby(["linea", "cliente_id", "producto", "agente"], as_index=False)["venta"].sum()
+mayor_fila = por_fila[por_fila["venta"] > 0].sort_values("venta").groupby(["linea", "cliente_id", "producto"])["agente"].last().to_dict()
+
 cli = ult.groupby(["linea", "cliente_id"], as_index=False).agg(cliente=("cliente", "last"), venta_12m=("venta", "sum"))
 cli = cli.merge(texto.reset_index(), on=["linea", "cliente_id"], how="left")
-cli["n_agentes"] = cli["agentes_12m"].fillna("").str.count(r"\|") + 1
+cli["agente_ppto_2026"] = [del_ppto(l, k, n) for l, k, n in zip(cli["linea"], cli["cliente_id"], cli["cliente"])]
+cli["agente_mas_facturo"] = [mayor_cli.get(k, "") for k in zip(cli["linea"], cli["cliente_id"])]
+cli["difieren"] = ((cli["agente_ppto_2026"] != "") & (cli["agente_ppto_2026"] != cli["agente_mas_facturo"])).map({True: "SI", False: ""})
 cli["agente_vigente"] = ""
 if RUTA_CLI.exists():
     prev = pd.read_excel(RUTA_CLI, dtype=str).fillna("").drop_duplicates(["linea", "cliente_id"]).set_index(["linea", "cliente_id"])
     cli["agente_vigente"] = [limpio(prev["agente_vigente"].get(k, "")) for k in zip(cli["linea"], cli["cliente_id"])]
-c.escribir_excel(cli.sort_values(["n_agentes", "venta_12m"], ascending=[False, False])
-                 [["linea", "cliente_id", "cliente", "venta_12m", "n_agentes", "agentes_12m", "agente_vigente"]],
-                 RUTA_CLI, hoja="clientes", anchos={"cliente": 40, "agentes_12m": 70})
-varios = cli[cli["n_agentes"] > 1]
-c.subtitulo("Clientes con más de un agente en los últimos 12 meses")
-print(f"{len(varios)} de {len(cli)} combinaciones de cliente y línea, con {100 * varios['venta_12m'].sum() / cli['venta_12m'].sum():.0f}% "
-      f"de la venta. Con agente vigente escrito: {int((cli['agente_vigente'] != '').sum())}")
-print("Regla: si escribes 'agente_vigente' en agentes_clientes.xlsx, ese agente recibe todo el cliente. Si lo dejas")
-print("vacío, cada fila se reparte según qué agente la facturó en los últimos 12 meses.")
-c.mostrar(varios.sort_values("venta_12m", ascending=False)[["linea", "cliente", "venta_12m", "agentes_12m"]], 12)
+cli["agente_asignado"] = cli["agente_vigente"].where(cli["agente_vigente"] != "",
+                                                     cli["agente_ppto_2026"].where(cli["agente_ppto_2026"] != "", cli["agente_mas_facturo"]))
+cli["regla"] = np.where(cli["agente_vigente"] != "", "1 vigente (manual)",
+                        np.where(cli["agente_ppto_2026"] != "", "2 presupuesto 2026", "3 el que más facturó"))
+c.escribir_excel(cli.sort_values(["difieren", "venta_12m"], ascending=[False, False])
+                 [["linea", "cliente_id", "cliente", "venta_12m", "agente_ppto_2026", "agente_mas_facturo", "difieren",
+                   "agentes_12m", "agente_vigente", "agente_asignado", "regla"]],
+                 RUTA_CLI, hoja="clientes", anchos={"cliente": 40, "agentes_12m": 60, "agente_ppto_2026": 30, "agente_mas_facturo": 30})
 
-# ------------------------------------------------------------------ 3. Repartir cada fila entre agentes
+c.subtitulo("Agente de cada cliente")
+print("Regla: 1) agente_vigente escrito a mano; 2) el del presupuesto 2026 (como la BD GENERAL original);")
+print("3) el que más facturó en los últimos 12 meses.")
+r = cli.groupby("regla").agg(clientes=("cliente_id", "size"), venta_12m=("venta_12m", "sum")).reset_index()
+r["% venta"] = (100 * r["venta_12m"] / r["venta_12m"].sum()).round(1)
+c.mostrar(r)
+dif = cli[cli["difieren"] == "SI"]
+print(f"\nClientes donde el presupuesto 2026 y las facturas dicen agentes distintos: {len(dif)} "
+      f"({100 * dif['venta_12m'].sum() / cli['venta_12m'].sum():.1f}% de la venta). Se usa el del presupuesto;")
+print("si alguno está mal, escribe el correcto en 'agente_vigente' de agentes_clientes.xlsx. Los más grandes:")
+c.mostrar(dif.sort_values("venta_12m", ascending=False)[["linea", "cliente", "venta_12m", "agente_ppto_2026", "agente_mas_facturo"]], 15)
+
+# ------------------------------------------------------------------ 3. Asignar cada fila a un agente
 vigente = {k: a for k, a in zip(zip(cli["linea"], cli["cliente_id"]), cli["agente_vigente"]) if a}
-por_fila = ult.groupby(["linea", "cliente_id", "producto", "agente"], as_index=False)["venta"].sum()
-por_fila = por_fila[por_fila["venta"] > 0]
-por_fila["parte"] = por_fila["venta"] / por_fila.groupby(["linea", "cliente_id", "producto"])["venta"].transform("sum")
-idx_fila = {k: g[["agente", "parte"]].values.tolist() for k, g in por_fila.groupby(["linea", "cliente_id", "producto"])}
-idx_cli = {k: g[["agente", "parte"]].values.tolist() for k, g in por_cli.groupby(["linea", "cliente_id"])}
-partes = []
-for i, f in filas.iterrows():
-    k_cli = (f["linea"], f["cliente_id"])
+asignados = []
+for f in filas.itertuples():
+    k_cli = (f.linea, f.cliente_id)
     if k_cli in vigente:
-        reparto, regla = [[vigente[k_cli], 1.0]], "agente vigente"
-    elif (f["linea"], f["cliente_id"], f["producto"]) in idx_fila:
-        reparto, regla = idx_fila[(f["linea"], f["cliente_id"], f["producto"])], "facturas de la fila"
-    elif k_cli in idx_cli:
-        reparto, regla = idx_cli[k_cli], "facturas del cliente"
+        agente, regla = vigente[k_cli], "1 vigente (manual)"
+    elif del_ppto(f.linea, f.cliente_id, f.cliente):
+        agente, regla = del_ppto(f.linea, f.cliente_id, f.cliente), "2 presupuesto 2026"
+    elif (f.linea, f.cliente_id, f.producto) in mayor_fila:
+        agente, regla = mayor_fila[(f.linea, f.cliente_id, f.producto)], "3 el que más facturó la fila"
+    elif k_cli in mayor_cli:
+        agente, regla = mayor_cli[k_cli], "3 el que más facturó al cliente"
     else:
-        reparto, regla = [["POR DEFINIR", 1.0]], "sin agente"
-    for agente, parte in reparto:
-        partes.append((i, agente, parte, regla))
-partes = pd.DataFrame(partes, columns=["i", "agente", "parte", "regla"])
-d = partes.merge(filas, left_on="i", right_index=True)
+        agente, regla = "POR DEFINIR", "4 sin agente"
+    asignados.append((agente, regla))
+d = filas.copy()
+d["agente"], d["regla"] = [a for a, _ in asignados], [r for _, r in asignados]
+d["parte"] = 1.0
 d["cantidad"] = d["cantidad_2027"] * d["parte"]
 d["venta_gerente"] = d["venta_final"] * d["parte"]
 d["precio_gerente"] = d["precio_2027"]
@@ -106,7 +150,6 @@ fac = v[(v["tipo_doc"] == "Factura") & (v["cantidad"] > 0) & (v["venta"] > 0)].s
 ultima = fac.groupby(["linea", "cliente_id", "producto"]).agg(precio_ultima_factura=("precio_usd", "last"), fecha_ultima_factura=("fecha", "last"))
 d = d.merge(ultima, on=["linea", "cliente_id", "producto"], how="left")
 d["fecha_ultima_factura"] = d["fecha_ultima_factura"].dt.strftime("%Y-%m-%d").fillna("")
-d["parte_del_agente_%"] = (100 * d["parte"]).round(0)
 d["precio_verificado"], d["comentario"] = np.nan, ""
 
 # ------------------------------------------------------------------ 4. Hojas por agente (respetando lo ya escrito)
@@ -118,7 +161,7 @@ if previos:
     d["comentario"] = d["id_fila"].map(escrito["comentario"]).fillna("").astype(str).replace("nan", "")
     for a in CARPETA.glob("Precios_*.xlsx"):          # se regeneran todas: un agente puede haber cambiado de clientes
         a.unlink()
-COLS = ["linea", "cliente", "clase_et", "producto", "unidad", "parte_del_agente_%", "cantidad", "precio_gerente",
+COLS = ["linea", "cliente", "clase_et", "producto", "unidad", "cantidad", "precio_gerente",
         "precio_ultima_factura", "fecha_ultima_factura", "precio_verificado", "comentario", "id_fila"]
 for agente, g in d.groupby("agente"):
     nombre = re.sub(r"[^A-Za-z0-9ÁÉÍÓÚÑáéíóúñ]+", "_", agente).strip("_")
@@ -138,7 +181,7 @@ for mes in range(1, 13):
                                "venta_gerentes": d["venta_gerente"] * w, "venta": d["venta_final_agente"] * w}))
 ppto = pd.concat(meses, ignore_index=True)
 c.guardar_cache(cfg, "presupuesto_2027", ppto)
-c.guardar_cache(cfg, "presupuesto_2027_anual", d.drop(columns=["i"]))
+c.guardar_cache(cfg, "presupuesto_2027_anual", d)
 cuota = d.pivot_table(index="agente", columns="linea", values="venta_final_agente", aggfunc="sum").reindex(columns=c.LINEAS).fillna(0)
 cuota["TOTAL"] = cuota.sum(axis=1)
 cuota = cuota.sort_values("TOTAL", ascending=False)

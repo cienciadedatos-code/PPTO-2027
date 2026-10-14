@@ -2,7 +2,7 @@
 
 Entrada : consulta/cache/base.parquet y ordenes.parquet, consulta/catalogo.xlsx
 Salida  : consulta/ordenes_revision.xlsx      (los gerentes marcan cada orden; se respetan sus cambios)
-          consulta/cierre_2026_ajustes.xlsx   (opcional: un número por línea si el gerente lo corrige)
+          consulta/cierre_2026_ajustes.xlsx   (opcional: el cierre 2026 de año completo que da cada gerente)
           output/cierre_2026.xlsx             (entregable)
           consulta/cache/cierre_2026.parquet  (para los pasos siguientes)
 Correr  : py src/05_cierre_2026.py
@@ -105,18 +105,34 @@ lin["ppto_restante_ajustado"] = lin["ppto_restante"] * lin["cumplimiento"]
 lin["estimado_resto"] = lin[["ordenes_firmes", "ritmo_del_anio"]].max(axis=1)
 lin["origen_estimado"] = (lin["ordenes_firmes"] >= lin["ritmo_del_anio"]).map({True: "órdenes", False: "ritmo"})
 
-# Corrección opcional del gerente: un número por línea
-if not RUTA_AJ.exists():
-    c.escribir_excel(pd.DataFrame({"linea": c.LINEAS, "estimado_resto_gerente": "", "comentario": ""}),
-                     RUTA_AJ, hoja="ajustes")
-aj = pd.read_excel(RUTA_AJ).set_index("linea")["estimado_resto_gerente"]
-aj = pd.to_numeric(aj, errors="coerce").dropna()
-for l, valor in aj.items():
-    if l in lin.index:
-        if valor < lin.loc[l, "ordenes_firmes"]:
-            c.aviso(f"{l}: el gerente estimó {valor:,.0f}, menos que las órdenes firmes "
-                    f"({lin.loc[l, 'ordenes_firmes']:,.0f}). Revisa las decisiones de las órdenes.")
-        lin.loc[l, ["estimado_resto", "origen_estimado"]] = [valor, "gerente"]
+# Cierre del gerente: el año 2026 COMPLETO por línea (enero a diciembre). Si lo escribe, sustituye
+# a la regla de órdenes contra ritmo: lo que falta = su cierre menos lo real de enero a la fecha.
+if RUTA_AJ.exists():
+    aj = pd.read_excel(RUTA_AJ)
+    if "cierre_2026_gerente" not in aj.columns:          # archivo de la versión anterior (solo meses restantes)
+        viejo = pd.to_numeric(aj.get("estimado_resto_gerente"), errors="coerce")
+        aj["cierre_2026_gerente"] = [lin.loc[l, "real_a_la_fecha"] + x if pd.notna(x) and l in lin.index else ""
+                                     for l, x in zip(aj["linea"], viejo)]
+        aj = aj.drop(columns=["estimado_resto_gerente"], errors="ignore")
+        c.escribir_excel(aj[["linea", "cierre_2026_gerente", "comentario"]], RUTA_AJ, hoja="ajustes")
+        c.aviso("cierre_2026_ajustes.xlsx tenía el formato anterior; se convirtió a 'cierre_2026_gerente' (año completo).")
+else:
+    aj = pd.DataFrame({"linea": c.LINEAS, "cierre_2026_gerente": "", "comentario": ""})
+    c.escribir_excel(aj, RUTA_AJ, hoja="ajustes")
+cierre_ger = pd.to_numeric(aj.set_index("linea")["cierre_2026_gerente"], errors="coerce").dropna()
+for l, total in cierre_ger.items():
+    if l not in lin.index:
+        c.aviso(f"cierre_2026_ajustes.xlsx: la línea '{l}' no existe. Usa el nombre tal cual (por ejemplo BU-PHARMA).")
+        continue
+    resto = total - lin.loc[l, "real_a_la_fecha"]
+    if resto < 0:
+        c.aviso(f"{l}: el cierre del gerente ({total:,.0f}) es menor que lo ya vendido ({lin.loc[l, 'real_a_la_fecha']:,.0f}). "
+                "Se toma cero para los meses que faltan.")
+        resto = 0.0
+    if resto < lin.loc[l, "ordenes_firmes"]:
+        c.aviso(f"{l}: con el cierre del gerente faltan {resto:,.0f}, menos que las órdenes firmes "
+                f"({lin.loc[l, 'ordenes_firmes']:,.0f}). Cada orden se cuenta al {100 * resto / lin.loc[l, 'ordenes_firmes']:.1f}%.")
+    lin.loc[l, ["estimado_resto", "origen_estimado"]] = [resto, "gerente"]
 lin["cierre_2026"] = lin["real_a_la_fecha"] + lin["estimado_resto"]
 lin["cierre_metodo_actual"] = lin["real_a_la_fecha"] + lin["ppto_restante"]     # como la pestaña PROYECCION (8+4)
 num = lin.select_dtypes("number").columns.drop("cumplimiento")
@@ -126,7 +142,7 @@ vista["cumplimiento"] = (vista["cumplimiento"] * 100).round(1)
 print(vista.T.to_string())
 print("\nCómo leerlo: 'estimado_resto' es lo que se usa. 'ppto_restante' y 'ppto_restante_ajustado' son referencias.")
 for l in c.LINEAS:
-    if lin.loc[l, "ordenes_firmes"] > ALERTA_ORDENES * lin.loc[l, "ritmo_del_anio"]:
+    if lin.loc[l, "origen_estimado"] != "gerente" and lin.loc[l, "ordenes_firmes"] > ALERTA_ORDENES * lin.loc[l, "ritmo_del_anio"]:
         c.aviso(f"{l}: las órdenes firmes ({lin.loc[l, 'ordenes_firmes'] / 1e6:,.2f} M) superan {ALERTA_ORDENES} veces "
                 f"el ritmo del año ({lin.loc[l, 'ritmo_del_anio'] / 1e6:,.2f} M). Probablemente no todas se facturan "
                 "en 2026: pide al gerente marcar las que PASAN a 2027.")
@@ -178,6 +194,9 @@ with pd.ExcelWriter(RUTA_OUT, engine="openpyxl") as w:
 c.subtitulo("Cierre 2026 por línea y mes (millones USD). Los meses estimados son los últimos")
 print((por_mes / 1e6).round(2).to_string())
 c.subtitulo("Controles")
+for l, total in cierre_ger.items():
+    if l in lin.index and total >= lin.loc[l, "real_a_la_fecha"]:
+        c.control(f"Cierre 2026 de {l} = número del gerente", cierre.loc[cierre["linea"] == l, "venta"].sum(), total, 1)
 dif = abs(cierre.groupby("linea")["venta"].sum().reindex(c.LINEAS) - lin["cierre_2026"]).max()
 (c.ok if dif < 1 else c.aviso)(f"La suma por clase coincide con el cierre por línea (diferencia máxima {dif:,.2f})")
 neg = int((est["venta"] < 0).sum())
